@@ -47,7 +47,7 @@ class Episode:
         padding_length_left = max(0, -start)
         assert padding_length_right == padding_length_left == 0 or should_pad
 
-        def pad(x):
+        def pad(x):  # pad zeros
             pad_right = torch.nn.functional.pad(x, [0 for _ in range(2 * x.ndim - 1)] + [padding_length_right]) if padding_length_right > 0 else x
             return torch.nn.functional.pad(pad_right, [0 for _ in range(2 * x.ndim - 2)] + [padding_length_left, 0]) if padding_length_left > 0 else pad_right
 

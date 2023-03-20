@@ -25,10 +25,13 @@ class Agent(nn.Module):
         agent_state_dict = torch.load(path_to_checkpoint, map_location=device)
         if load_tokenizer:
             self.tokenizer.load_state_dict(extract_state_dict(agent_state_dict, 'tokenizer'))
+            print("load pre-trained tokenizer")
         if load_world_model:
             self.world_model.load_state_dict(extract_state_dict(agent_state_dict, 'world_model'))
+            print("load pre-trained world model")
         if load_actor_critic:
             self.actor_critic.load_state_dict(extract_state_dict(agent_state_dict, 'actor_critic'))
+            print("load pre-trained actor critic")
 
     def act(self, obs: torch.FloatTensor, should_sample: bool = True, temperature: float = 1.0) -> torch.LongTensor:
         input_ac = obs if self.actor_critic.use_original_obs else torch.clamp(self.tokenizer.encode_decode(obs, should_preprocess=True, should_postprocess=True), 0, 1)

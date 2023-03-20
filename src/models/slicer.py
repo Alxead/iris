@@ -32,7 +32,7 @@ class Head(Slicer):
 
     def forward(self, x: torch.Tensor, num_steps: int, prev_steps: int) -> torch.Tensor:
         x_sliced = x[:, self.compute_slice(num_steps, prev_steps)]  # x is (B, T, E)
-        return self.head_module(x_sliced)
+        return self.head_module(x_sliced)   # graph break in forward?
 
 
 class Embedder(nn.Module):

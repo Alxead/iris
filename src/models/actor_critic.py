@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from dataset import Batch
 from envs.world_model_env import WorldModelEnv
+from envs.vanilla_world_model_env import VanillaWorldModelEnv
 from models.tokenizer import Tokenizer
 from models.world_model import WorldModel
 from utils import compute_lambda_returns, LossWithIntermediateLosses
@@ -34,9 +35,10 @@ class ImagineOutput:
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, act_vocab_size, use_original_obs: bool = False) -> None:
+    def __init__(self, act_vocab_size, use_original_obs: bool = False, world_model_type: str = 'default') -> None:
         super().__init__()
         self.use_original_obs = use_original_obs
+        self.world_model_type = world_model_type
         self.conv1 = nn.Conv2d(3, 32, 3, stride=1, padding=1)
         self.maxp1 = nn.MaxPool2d(2, 2)
         self.conv2 = nn.Conv2d(32, 32, 3, stride=1, padding=1)
@@ -87,10 +89,11 @@ class ActorCritic(nn.Module):
         x = F.relu(self.maxp4(self.conv4(x)))
         x = torch.flatten(x, start_dim=1)
 
-        if mask_padding is None:
-            self.hx, self.cx = self.lstm(x, (self.hx, self.cx))
-        else:
-            self.hx[mask_padding], self.cx[mask_padding] = self.lstm(x, (self.hx[mask_padding], self.cx[mask_padding]))
+        with torch.cuda.amp.autocast(enabled=False):
+            if mask_padding is None:
+                self.hx, self.cx = self.lstm(x.float(), (self.hx, self.cx))
+            else:
+                self.hx[mask_padding], self.cx[mask_padding] = self.lstm(x.float(), (self.hx[mask_padding], self.cx[mask_padding]))
 
         logits_actions = rearrange(self.actor_linear(self.hx), 'b a -> b 1 a')
         means_values = rearrange(self.critic_linear(self.hx), 'b 1 -> b 1 1')
@@ -127,7 +130,13 @@ class ActorCritic(nn.Module):
         assert initial_observations.ndim == 5 and initial_observations.shape[2:] == (3, 64, 64)
         assert mask_padding[:, -1].all()
         device = initial_observations.device
-        wm_env = WorldModelEnv(tokenizer, world_model, device)
+
+        if self.world_model_type == 'default':
+            wm_env = WorldModelEnv(tokenizer, world_model, device)
+        elif self.world_model_type == 'vanilla':
+            wm_env = VanillaWorldModelEnv(tokenizer, world_model, device)
+        else:
+            raise NotImplementedError
 
         all_actions = []
         all_logits_actions = []

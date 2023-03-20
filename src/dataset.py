@@ -61,10 +61,12 @@ class EpisodesDataset:
         self.newly_modified_episodes.add(episode_id)
         return episode_id
 
-    def sample_batch(self, batch_num_samples: int, sequence_length: int, weights: Optional[Tuple[float]] = None, sample_from_start: bool = True) -> Batch:
-        return self._collate_episodes_segments(self._sample_episodes_segments(batch_num_samples, sequence_length, weights, sample_from_start))
+    def sample_batch(self, batch_num_samples: int, sequence_length: int, weights: Optional[Tuple[float]] = None,
+                     sample_from_start: bool = True, sample_fixed_history: bool = False) -> Batch:
+        return self._collate_episodes_segments(self._sample_episodes_segments(batch_num_samples, sequence_length, weights, sample_from_start, sample_fixed_history))
 
-    def _sample_episodes_segments(self, batch_num_samples: int, sequence_length: int, weights: Optional[Tuple[float]], sample_from_start: bool) -> List[Episode]:
+    def _sample_episodes_segments(self, batch_num_samples: int, sequence_length: int, weights: Optional[Tuple[float]],
+                                  sample_from_start: bool, sample_fixed_history: bool) -> List[Episode]:
         num_episodes = len(self.episodes)
         num_weights = len(weights) if weights is not None else 0
 
@@ -79,12 +81,22 @@ class EpisodesDataset:
 
         sampled_episodes_segments = []
         for sampled_episode in sampled_episodes:
-            if sample_from_start:
-                start = random.randint(0, len(sampled_episode) - 1)
-                stop = start + sequence_length
-            else:
-                stop = random.randint(1, len(sampled_episode))
+
+            # ensure the length of the sampled episode is greater or equal to 2
+            while len(sampled_episode) < 2:
+                sampled_episode = random.choices(self.episodes, k=1)[0]
+            assert len(sampled_episode) >= 2
+
+            if sample_fixed_history:
+                stop = random.randint(2, len(sampled_episode) + 1)
                 start = stop - sequence_length
+            else:
+                if sample_from_start:
+                    start = random.randint(0, len(sampled_episode) - 1)
+                    stop = start + sequence_length
+                else:
+                    stop = random.randint(1, len(sampled_episode))  # original code: random.randint(1, len(sampled_episode))
+                    start = stop - sequence_length
             sampled_episodes_segments.append(sampled_episode.segment(start, stop, should_pad=True))
             assert len(sampled_episodes_segments[-1]) == sequence_length
         return sampled_episodes_segments

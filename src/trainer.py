@@ -1,11 +1,13 @@
 from collections import defaultdict
 from functools import partial
 from pathlib import Path
+import os
 import shutil
 import sys
 import time
 from typing import Any, Dict, Optional, Tuple
 
+import csv
 import hydra
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf
@@ -21,6 +23,8 @@ from episode import Episode
 from make_reconstructions import make_reconstructions_from_batch
 from models.actor_critic import ActorCritic
 from models.world_model import WorldModel
+from models.vanilla_world_model import VanillaWorldModel
+from models.mask_world_model import MaskWorldModel
 from utils import configure_optimizer, EpisodeDirManager, set_seed
 
 
@@ -40,6 +44,7 @@ class Trainer:
         self.start_epoch = 1
         self.device = torch.device(cfg.common.device)
 
+        self.root_dir = Path.cwd()
         self.ckpt_dir = Path('checkpoints')
         self.media_dir = Path('media')
         self.episode_dir = self.media_dir / 'episodes'
@@ -79,8 +84,19 @@ class Trainer:
         assert self.cfg.training.should or self.cfg.evaluation.should
         env = train_env if self.cfg.training.should else test_env
 
+        # VQVAE tokenizer
         tokenizer = instantiate(cfg.tokenizer)
-        world_model = WorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
+        # World Model
+        if cfg.common.world_model_type == 'default':
+            world_model = WorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
+        elif cfg.common.world_model_type == 'vanilla':
+            world_model = VanillaWorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
+        elif cfg.common.world_model_type == 'mask':
+            world_model = MaskWorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
+        else:
+            raise NotImplementedError
+        self.world_model_type = cfg.common.world_model_type
+        # Actor Critic
         actor_critic = ActorCritic(**cfg.actor_critic, act_vocab_size=env.num_actions)
         self.agent = Agent(tokenizer, world_model, actor_critic).to(self.device)
         print(f'{sum(p.numel() for p in self.agent.tokenizer.parameters())} parameters in agent.tokenizer')
@@ -90,12 +106,19 @@ class Trainer:
         self.optimizer_tokenizer = torch.optim.Adam(self.agent.tokenizer.parameters(), lr=cfg.training.learning_rate)
         self.optimizer_world_model = configure_optimizer(self.agent.world_model, cfg.training.learning_rate, cfg.training.world_model.weight_decay)
         self.optimizer_actor_critic = torch.optim.Adam(self.agent.actor_critic.parameters(), lr=cfg.training.learning_rate)
+        self.use_amp = cfg.training.use_amp
+        self.loss_scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         if cfg.initialization.path_to_checkpoint is not None:
             self.agent.load(**cfg.initialization, device=self.device)
 
         if cfg.common.resume:
             self.load_checkpoint()
+
+        # # compile the model
+        # if cfg.common.compile:
+        #     print("compiling the model...")
+        #     self.agent = torch.compile(self.agent)  # requires PyTorch 2.0
 
     def run(self) -> None:
 
@@ -122,6 +145,13 @@ class Trainer:
             for metrics in to_log:
                 wandb.log({'epoch': epoch, **metrics})
 
+            # Final evaluation on 100 episodes
+            if epoch == self.cfg.common.epochs:
+                self.cfg.collection.test.config.num_episodes = 100
+                self.test_dataset.clear()
+                to_log = self.test_collector.collect(self.agent, epoch, **self.cfg.collection.test.config)
+                self.save_final_result(to_log=to_log)
+
         self.finish()
 
     def train_agent(self, epoch: int) -> None:
@@ -136,42 +166,60 @@ class Trainer:
 
         w = self.cfg.training.sampling_weights
 
+        # train tokenizer
         if epoch > cfg_tokenizer.start_after_epochs:
-            metrics_tokenizer = self.train_component(self.agent.tokenizer, self.optimizer_tokenizer, sequence_length=1, sample_from_start=True, sampling_weights=w, **cfg_tokenizer)
+            metrics_tokenizer = self.train_component(self.agent.tokenizer, self.optimizer_tokenizer, sequence_length=1, sample_from_start=True, sample_fixed_history=False, sampling_weights=w, **cfg_tokenizer)
         self.agent.tokenizer.eval()
 
+        # train world model
         if epoch > cfg_world_model.start_after_epochs:
-            metrics_world_model = self.train_component(self.agent.world_model, self.optimizer_world_model, sequence_length=self.cfg.common.sequence_length, sample_from_start=True, sampling_weights=w, tokenizer=self.agent.tokenizer, **cfg_world_model)
+            sequence_length = self.cfg.common.sequence_length
+            sample_fixed_history = False
+            if self.world_model_type == 'vanilla' or self.world_model_type == 'mask':
+                sample_fixed_history = True
+                sequence_length = self.cfg.common.sequence_length + 1
+            metrics_world_model = self.train_component(self.agent.world_model, self.optimizer_world_model,
+                                                       sequence_length=sequence_length, sample_from_start=True, sample_fixed_history=sample_fixed_history,
+                                                       sampling_weights=w, tokenizer=self.agent.tokenizer, **cfg_world_model)
         self.agent.world_model.eval()
 
+        # train actor critic
         if epoch > cfg_actor_critic.start_after_epochs:
-            metrics_actor_critic = self.train_component(self.agent.actor_critic, self.optimizer_actor_critic, sequence_length=1 + self.cfg.training.actor_critic.burn_in, sample_from_start=False, sampling_weights=w, tokenizer=self.agent.tokenizer, world_model=self.agent.world_model, **cfg_actor_critic)
+            metrics_actor_critic = self.train_component(self.agent.actor_critic, self.optimizer_actor_critic,
+                                                        sequence_length=1 + self.cfg.training.actor_critic.burn_in, sample_from_start=False, sample_fixed_history=False,
+                                                        sampling_weights=w, tokenizer=self.agent.tokenizer, world_model=self.agent.world_model, **cfg_actor_critic)
         self.agent.actor_critic.eval()
 
         return [{'epoch': epoch, **metrics_tokenizer, **metrics_world_model, **metrics_actor_critic}]
 
-    def train_component(self, component: nn.Module, optimizer: torch.optim.Optimizer, steps_per_epoch: int, batch_num_samples: int, grad_acc_steps: int, max_grad_norm: Optional[float], sequence_length: int, sampling_weights: Optional[Tuple[float]], sample_from_start: bool, **kwargs_loss: Any) -> Dict[str, float]:
+    def train_component(self, component: nn.Module, optimizer: torch.optim.Optimizer, steps_per_epoch: int, batch_num_samples: int,
+                        grad_acc_steps: int, max_grad_norm: Optional[float], sequence_length: int, sampling_weights: Optional[Tuple[float]],
+                        sample_from_start: bool, sample_fixed_history: bool, **kwargs_loss: Any) -> Dict[str, float]:
         loss_total_epoch = 0.0
         intermediate_losses = defaultdict(float)
 
         for _ in tqdm(range(steps_per_epoch), desc=f"Training {str(component)}", file=sys.stdout):
             optimizer.zero_grad()
             for _ in range(grad_acc_steps):
-                batch = self.train_dataset.sample_batch(batch_num_samples, sequence_length, sampling_weights, sample_from_start)
+                batch = self.train_dataset.sample_batch(batch_num_samples, sequence_length, sampling_weights, sample_from_start, sample_fixed_history)
                 batch = self._to_device(batch)
 
-                losses = component.compute_loss(batch, **kwargs_loss) / grad_acc_steps
-                loss_total_step = losses.loss_total
-                loss_total_step.backward()
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    losses = component.compute_loss(batch, **kwargs_loss) / grad_acc_steps
+                    loss_total_step = losses.loss_total
+                self.loss_scaler.scale(loss_total_step).backward()
                 loss_total_epoch += loss_total_step.item() / steps_per_epoch
 
                 for loss_name, loss_value in losses.intermediate_losses.items():
                     intermediate_losses[f"{str(component)}/train/{loss_name}"] += loss_value / steps_per_epoch
 
             if max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(component.parameters(), max_grad_norm)
+                self.loss_scaler.unscale_(optimizer)  # Unscales the gradients of optimizer's assigned params in-place
+                torch.nn.utils.clip_grad_norm_(component.parameters(), max_grad_norm)  # Since the gradients of optimizer's assigned params are unscaled, clips as usual:
 
-            optimizer.step()
+            # optimizer.step()
+            self.loss_scaler.step(optimizer)
+            self.loss_scaler.update()
 
         metrics = {f'{str(component)}/train/total_loss': loss_total_epoch, **intermediate_losses}
         return metrics
@@ -189,8 +237,13 @@ class Trainer:
         if epoch > cfg_tokenizer.start_after_epochs:
             metrics_tokenizer = self.eval_component(self.agent.tokenizer, cfg_tokenizer.batch_num_samples, sequence_length=1)
 
+        # eval world model
         if epoch > cfg_world_model.start_after_epochs:
-            metrics_world_model = self.eval_component(self.agent.world_model, cfg_world_model.batch_num_samples, sequence_length=self.cfg.common.sequence_length, tokenizer=self.agent.tokenizer)
+            sequence_length = self.cfg.common.sequence_length
+            if self.world_model_type == 'vanilla' or self.world_model_type == 'mask':
+                sequence_length = self.cfg.common.sequence_length + 1
+            metrics_world_model = self.eval_component(self.agent.world_model, cfg_world_model.batch_num_samples,
+                                                      sequence_length=sequence_length, tokenizer=self.agent.tokenizer)
 
         if epoch > cfg_actor_critic.start_after_epochs:
             self.inspect_imagination(epoch)
@@ -243,15 +296,43 @@ class Trainer:
 
         return to_log
 
+    def save_final_result(self, to_log):
+        for metrics in to_log:
+            metrics = {k.replace('test_dataset', 'final_eval'): v for k, v in metrics.items()}
+            wandb.log({**metrics})
+
+        avg_episode_return = to_log[-1]['test_dataset/return']
+        eval_data = {
+            'game': self.cfg.env.train.id,
+            'seed': self.cfg.common.seed,
+            'return': avg_episode_return
+        }
+
+        file_name = self.cfg.wandb.group.split('_')[0] + '.csv'
+        csv_path = self.root_dir.parent / file_name
+        should_write_header = False if csv_path.exists() else True
+        csv_file = open(csv_path, 'a')
+        csv_writer = csv.DictWriter(csv_file, fieldnames=eval_data.keys(), restval=0.0)
+        if should_write_header:
+            csv_writer.writeheader()
+        csv_writer.writerow(eval_data)
+        csv_file.flush()
+        csv_file.close()
+
     def _save_checkpoint(self, epoch: int, save_agent_only: bool) -> None:
         torch.save(self.agent.state_dict(), self.ckpt_dir / 'last.pt')
         if not save_agent_only:
             torch.save(epoch, self.ckpt_dir / 'epoch.pt')
+            # optimizer and scaler
             torch.save({
                 "optimizer_tokenizer": self.optimizer_tokenizer.state_dict(),
                 "optimizer_world_model": self.optimizer_world_model.state_dict(),
                 "optimizer_actor_critic": self.optimizer_actor_critic.state_dict(),
             }, self.ckpt_dir / 'optimizer.pt')
+            torch.save({
+                "scaler": self.loss_scaler.state_dict()
+            }, self.ckpt_dir / 'scaler.pt')
+            # dataset
             ckpt_dataset_dir = self.ckpt_dir / 'dataset'
             ckpt_dataset_dir.mkdir(exist_ok=True, parents=False)
             self.train_dataset.update_disk_checkpoint(ckpt_dataset_dir)
@@ -268,10 +349,15 @@ class Trainer:
         assert self.ckpt_dir.is_dir()
         self.start_epoch = torch.load(self.ckpt_dir / 'epoch.pt') + 1
         self.agent.load(self.ckpt_dir / 'last.pt', device=self.device)
+        # optimizer and scaler
         ckpt_opt = torch.load(self.ckpt_dir / 'optimizer.pt', map_location=self.device)
         self.optimizer_tokenizer.load_state_dict(ckpt_opt['optimizer_tokenizer'])
         self.optimizer_world_model.load_state_dict(ckpt_opt['optimizer_world_model'])
         self.optimizer_actor_critic.load_state_dict(ckpt_opt['optimizer_actor_critic'])
+        if os.path.exists(self.ckpt_dir / 'scaler.pt'):
+            ckpt_scaler = torch.load(self.ckpt_dir / 'scaler.pt', map_location=self.device)
+            self.loss_scaler.load_state_dict(ckpt_scaler['scaler'])
+
         self.train_dataset.load_disk_checkpoint(self.ckpt_dir / 'dataset')
         if self.cfg.evaluation.should:
             self.test_dataset.num_seen_episodes = torch.load(self.ckpt_dir / 'num_seen_episodes_test_dataset.pt')
@@ -281,4 +367,11 @@ class Trainer:
         return {k: batch[k].to(self.device) for k in batch}
 
     def finish(self) -> None:
+        if not self.cfg.common.save_train_set:
+            # delete episodes in training dataset
+            shutil.rmtree(self.ckpt_dir / 'dataset')
+        if not self.cfg.common.save_media:
+            # delete episodes in media
+            shutil.rmtree(self.episode_dir)
+
         wandb.finish()

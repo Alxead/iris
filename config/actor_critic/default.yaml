@@ -1,1 +1,2 @@
 use_original_obs: False
+world_model_type: ${common.world_model_type}
