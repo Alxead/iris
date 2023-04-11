@@ -112,7 +112,7 @@ ATARINAME_100K_GAMES_SUBSET = [
 # score_dict_spr, score_spr, _ = load_json_scores('SPR', atari_games=ATARI_100K_GAMES_SUBSET)
 
 score_dict_iris, score_iris, _ = load_json_scores('IRIS', atari_games=ATARI_100K_GAMES_SUBSET)
-score_dict_myrun, score_myrun, _ = load_csv_scores(file_name='VanillaWM-HalfEpochs-wmBS64-context2.csv', atari_games=ATARINAME_100K_GAMES_SUBSET)
+score_dict_myrun, score_myrun, _ = load_csv_scores(file_name='BlockCausal-64tokens-smallmodel-LongSchedule.csv', atari_games=ATARINAME_100K_GAMES_SUBSET)
 
 
 score_data_dict_games = {

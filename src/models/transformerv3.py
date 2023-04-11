@@ -23,6 +23,7 @@ class MaskTransformerConfig:
     embed_pdrop: float
     resid_pdrop: float
     attn_pdrop: float
+    num_iter: int
 
     @property
     def max_tokens(self):

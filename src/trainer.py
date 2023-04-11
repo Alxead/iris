@@ -22,7 +22,7 @@ from envs import SingleProcessEnv, MultiProcessEnv
 from episode import Episode
 from make_reconstructions import make_reconstructions_from_batch
 from models.actor_critic import ActorCritic
-from models.world_model import WorldModel
+from models.world_model import WorldModel, BlockCausalWorldModel
 from models.vanilla_world_model import VanillaWorldModel
 from models.mask_world_model import MaskWorldModel
 from utils import configure_optimizer, EpisodeDirManager, set_seed
@@ -89,6 +89,8 @@ class Trainer:
         # World Model
         if cfg.common.world_model_type == 'default':
             world_model = WorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
+        elif cfg.common.world_model_type == 'block':
+            world_model = BlockCausalWorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
         elif cfg.common.world_model_type == 'vanilla':
             world_model = VanillaWorldModel(obs_vocab_size=tokenizer.vocab_size, act_vocab_size=env.num_actions, config=instantiate(cfg.world_model))
         elif cfg.common.world_model_type == 'mask':

@@ -11,8 +11,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from dataset import Batch
-from envs.world_model_env import WorldModelEnv
+from envs.world_model_env import WorldModelEnv, BlockCausalWorldModelEnv
 from envs.vanilla_world_model_env import VanillaWorldModelEnv
+from envs.mask_world_model_env import MaskWorldModelEnv
 from models.tokenizer import Tokenizer
 from models.world_model import WorldModel
 from utils import compute_lambda_returns, LossWithIntermediateLosses
@@ -133,8 +134,12 @@ class ActorCritic(nn.Module):
 
         if self.world_model_type == 'default':
             wm_env = WorldModelEnv(tokenizer, world_model, device)
+        elif self.world_model_type == 'block':
+            wm_env = BlockCausalWorldModelEnv(tokenizer, world_model, device)
         elif self.world_model_type == 'vanilla':
             wm_env = VanillaWorldModelEnv(tokenizer, world_model, device)
+        elif self.world_model_type == 'mask':
+            wm_env = MaskWorldModelEnv(tokenizer, world_model, device)
         else:
             raise NotImplementedError
 

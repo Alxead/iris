@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Tuple
 
 import psutil
 import torch
+import numpy as np
+from scipy.special import softmax
 
 from episode import Episode
 
@@ -13,12 +15,16 @@ Batch = Dict[str, torch.Tensor]
 
 
 class EpisodesDataset:
-    def __init__(self, max_num_episodes: Optional[int] = None, name: Optional[str] = None) -> None:
+    def __init__(self, max_num_episodes: Optional[int] = None, name: Optional[str] = None,
+                 balanced_dataset_sampling: Optional[bool] = False, temperature: Optional[float] = 20.0) -> None:
         self.max_num_episodes = max_num_episodes
         self.name = name if name is not None else 'dataset'
+        self.balanced_dataset_sampling = balanced_dataset_sampling
+        self.temperature = temperature
         self.num_seen_episodes = 0
         self.episodes = deque()
         self.episode_id_to_queue_idx = dict()
+        self.episode_id_to_visit_count = dict()
         self.newly_modified_episodes, self.newly_deleted_episodes = set(), set()
 
     def __len__(self) -> int:
@@ -51,11 +57,13 @@ class EpisodesDataset:
         assert len(id_to_delete) == 1
         self.newly_deleted_episodes.add(id_to_delete[0])
         self.episode_id_to_queue_idx = {k: v - 1 for k, v in self.episode_id_to_queue_idx.items() if v > 0}
+        self.episode_id_to_visit_count = {k: v for k, v in self.episode_id_to_visit_count.items() if k not in id_to_delete}
         return self.episodes.popleft()
 
     def _append_new_episode(self, episode):
         episode_id = self.num_seen_episodes
         self.episode_id_to_queue_idx[episode_id] = len(self.episodes)
+        self.episode_id_to_visit_count[episode_id] = 0
         self.episodes.append(episode)
         self.num_seen_episodes += 1
         self.newly_modified_episodes.add(episode_id)
@@ -67,17 +75,28 @@ class EpisodesDataset:
 
     def _sample_episodes_segments(self, batch_num_samples: int, sequence_length: int, weights: Optional[Tuple[float]],
                                   sample_from_start: bool, sample_fixed_history: bool) -> List[Episode]:
-        num_episodes = len(self.episodes)
-        num_weights = len(weights) if weights is not None else 0
 
-        if num_weights < num_episodes:
-            weights = [1] * num_episodes
+        if self.balanced_dataset_sampling:
+            episode_ids = list(self.episode_id_to_visit_count.keys())
+            counts = np.array([v for k, v in self.episode_id_to_visit_count.items()])
+            probs = softmax(-counts / self.temperature)
+            sampled_episode_ids = np.random.choice(episode_ids, size=batch_num_samples, replace=True, p=probs)
+            sampled_episodes = []
+            for id in sampled_episode_ids:
+                sampled_episodes.append(self.get_episode(id))
+                self.episode_id_to_visit_count[id] += 1
         else:
-            assert all([0 <= x <= 1 for x in weights]) and sum(weights) == 1
-            sizes = [num_episodes // num_weights + (num_episodes % num_weights) * (i == num_weights - 1) for i in range(num_weights)]
-            weights = [w / s for (w, s) in zip(weights, sizes) for _ in range(s)]
+            num_episodes = len(self.episodes)
+            num_weights = len(weights) if weights is not None else 0
 
-        sampled_episodes = random.choices(self.episodes, k=batch_num_samples, weights=weights)
+            if num_weights < num_episodes:
+                weights = [1] * num_episodes
+            else:
+                assert all([0 <= x <= 1 for x in weights]) and sum(weights) == 1
+                sizes = [num_episodes // num_weights + (num_episodes % num_weights) * (i == num_weights - 1) for i in range(num_weights)]
+                weights = [w / s for (w, s) in zip(weights, sizes) for _ in range(s)]
+
+            sampled_episodes = random.choices(self.episodes, k=batch_num_samples, weights=weights)
 
         sampled_episodes_segments = []
         for sampled_episode in sampled_episodes:
@@ -95,7 +114,7 @@ class EpisodesDataset:
                     start = random.randint(0, len(sampled_episode) - 1)
                     stop = start + sequence_length
                 else:
-                    stop = random.randint(1, len(sampled_episode))  # original code: random.randint(1, len(sampled_episode))
+                    stop = random.randint(1, len(sampled_episode))
                     start = stop - sequence_length
             sampled_episodes_segments.append(sampled_episode.segment(start, stop, should_pad=True))
             assert len(sampled_episodes_segments[-1]) == sequence_length
@@ -140,8 +159,10 @@ class EpisodesDatasetRamMonitoring(EpisodesDataset):
     Prevent episode dataset from going out of RAM.
     Warning: % looks at system wide RAM usage while G looks only at process RAM usage.
     """
-    def __init__(self, max_ram_usage: str, name: Optional[str] = None) -> None:
-        super().__init__(max_num_episodes=None, name=name)
+    def __init__(self, max_ram_usage: str, name: Optional[str] = None,
+                 balanced_dataset_sampling: Optional[bool] = False, temperature: Optional[float] = 20.0) -> None:
+        super().__init__(max_num_episodes=None, name=name,
+                         balanced_dataset_sampling=balanced_dataset_sampling, temperature=temperature)
         self.max_ram_usage = max_ram_usage
         self.num_steps = 0
         self.max_num_steps = None

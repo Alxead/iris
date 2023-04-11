@@ -86,11 +86,17 @@ class SelfAttention(nn.Module):
         self.value = nn.Linear(config.embed_dim, config.embed_dim)
         self.attn_drop = nn.Dropout(config.attn_pdrop)
         self.resid_drop = nn.Dropout(config.resid_pdrop)
+        self.dropout_p = config.attn_pdrop
         self.proj = nn.Linear(config.embed_dim, config.embed_dim)
 
-        causal_mask = torch.tril(torch.ones(config.max_tokens, config.max_tokens))
+        causal_mask = torch.tril(torch.ones(config.max_tokens, config.max_tokens)).view(1, 1, config.max_tokens, config.max_tokens)
         block_causal_mask = torch.max(causal_mask, torch.block_diag(*[torch.ones(config.tokens_per_block, config.tokens_per_block) for _ in range(config.max_blocks)]))
         self.register_buffer('mask', causal_mask if config.attention == 'causal' else block_causal_mask)
+
+        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        if not self.flash:
+            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
     def forward(self, x: torch.Tensor, kv_cache: Optional[KVCache] = None) -> torch.Tensor:
         B, T, C = x.size()
@@ -108,11 +114,20 @@ class SelfAttention(nn.Module):
             kv_cache.update(k, v)
             k, v = kv_cache.get()
 
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.mask[L:L + T, :L + T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        att = self.attn_drop(att)
-        y = att @ v
+        if self.flash:
+            # efficient attention using Flash Attention CUDA kernels
+            attn_mask = self.mask[:, :, L:L + T, :L + T].to(torch.bool)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v,
+                                                                 attn_mask=attn_mask,
+                                                                 dropout_p=self.dropout_p,
+                                                                 is_causal=False)
+        else:
+            # manual implementation of attention
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            att = att.masked_fill(self.mask[:, :, L:L + T, :L + T] == 0, float('-inf'))
+            att = F.softmax(att, dim=-1)
+            att = self.attn_drop(att)
+            y = att @ v
         y = rearrange(y, 'b h t e -> b t (h e)')
 
         y = self.resid_drop(self.proj(y))

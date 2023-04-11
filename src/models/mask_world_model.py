@@ -1,12 +1,15 @@
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
+import numpy as np
 from einops import rearrange
 import math
+import random
 import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions.categorical import Categorical
 
 from dataset import Batch
 from .kv_caching import KeysValues
@@ -24,6 +27,27 @@ class MaskWorldModelOutput:
     logits_rewards: torch.FloatTensor
     logits_ends: torch.FloatTensor
     mask: torch.bool    # 0 is keep, 1 is remove
+
+
+def log(t, eps=1e-20):
+    return torch.log(t.clamp(min=eps))
+
+
+def gumbel_noise(t):
+    noise = torch.zeros_like(t).uniform_(0, 1)
+    return -log(-log(noise))
+
+
+def gumbel_sample(t, temperature=1., dim=-1):
+    return ((t / max(temperature, 1e-10)) + gumbel_noise(t)).argmax(dim=dim)
+
+
+def top_k(logits, thres=0.9):
+    k = math.ceil((1 - thres) * logits.shape[-1])
+    val, ind = logits.topk(k, dim=-1)
+    probs = torch.full_like(logits, float('-inf'))
+    probs.scatter_(2, ind, val)
+    return probs
 
 
 class SelfAttention(nn.Module):
@@ -131,28 +155,30 @@ class MaskWorldModel(nn.Module):
         super().__init__()
         self.obs_vocab_size, self.act_vocab_size = obs_vocab_size, act_vocab_size
         self.config = config
+        self.num_iter = config.num_iter
 
         # --------------------------------------------------------------------------
         # encoder specifics
         self.obs_embed = nn.Embedding(obs_vocab_size, config.embed_dim)
         self.act_embed = nn.Embedding(act_vocab_size, config.embed_dim)
         self.encoder_pos_embed = nn.Parameter(torch.zeros(1, config.tokens_per_block, config.embed_dim))
-        self.pos_drop = nn.Dropout(config.embed_pdrop)
+        self.pos_drop = nn.Dropout(p=config.embed_pdrop)
 
         self.encoder_blocks = nn.ModuleList([EncoderBlock(config) for _ in range(config.encoder_num_layers)])
         self.encoder_norm = nn.LayerNorm(config.embed_dim)
+
         self.act_encoder = nn.Sequential(
             nn.Linear(config.embed_dim, config.embed_dim),
             nn.ReLU(),
             nn.Linear(config.embed_dim, config.embed_dim),
         )
-
         # --------------------------------------------------------------------------
 
         # --------------------------------------------------------------------------
         # decoder specifics
         self.decoder_pos_embed = nn.Parameter(torch.zeros(1, config.tokens_per_block + 2, config.embed_dim))
-        # dropout? add position embedding for cross attention keys and values?
+        self.context_pos_embed = nn.Parameter(torch.zeros(1, (config.tokens_per_block + 1) * 4, config.embed_dim))
+
         self.reward_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         self.end_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
         self.mask_token = nn.Parameter(torch.zeros(1, 1, config.embed_dim))
@@ -204,7 +230,9 @@ class MaskWorldModel(nn.Module):
         x: [N, L, D], sequence
         """
         N, L, D = x.shape  # batch, length, dim
-        len_keep = int(L * (1 - mask_ratio))
+
+        len_keep = round(L * (1 - mask_ratio))
+        len_keep = min(len_keep, L - 1)
 
         noise = torch.rand(N, L, device=x.device)  # noise in [0, 1]
 
@@ -224,9 +252,38 @@ class MaskWorldModel(nn.Module):
 
         return x_masked, mask, ids_restore
 
-    def forward_context(self, prev_obs_tokens, prev_act_tokens):
-        B, context_length, K = prev_obs_tokens.size()
+    def scores_masking(self, x, mask_ratio, scores, is_ranking_scores=True, is_confidence_scores=False):
+        """
+        Tokens with low "ranking scores" are kept, while tokens with high "ranking scores" are removed (masked)
+        Tokens with high "confidence scores" are kept, while tokens with low "confidence scores" are removed (masked)
+        """
+        assert is_ranking_scores ^ is_confidence_scores
+        N, L, D = x.shape  # batch, length, dim
 
+        len_keep = round(L * (1 - mask_ratio))
+        len_keep = min(len_keep, L - 1)  # mask at least 1 token
+
+        if is_confidence_scores:
+            scores = -scores
+        ids_shuffle = torch.argsort(scores, dim=1)  # ascend: small is keep, large is remove (mask)
+        ids_restore = torch.argsort(ids_shuffle, dim=1)
+
+        # keep the first subset
+        ids_keep = ids_shuffle[:, :len_keep]
+        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+
+        # generate the binary mask: 0 is keep, 1 is remove
+        mask = torch.ones([N, L], device=x.device)
+        mask[:, :len_keep] = 0
+        # unshuffle to get the binary mask
+        mask = torch.gather(mask, dim=1, index=ids_restore).bool()
+
+        return x_masked, mask, ids_restore
+
+    def forward_context(self, prev_obs_tokens, prev_act_tokens):
+        assert prev_obs_tokens.size(1) == prev_act_tokens.size(1)
+
+        B, context_length, K = prev_obs_tokens.size()
         prev_obs_tokens = rearrange(prev_obs_tokens, 'b l k -> (b l) k')
         obs_sequences = self.obs_embed(prev_obs_tokens)
         obs_sequences = obs_sequences + self.encoder_pos_embed
@@ -243,16 +300,15 @@ class MaskWorldModel(nn.Module):
         act_sequences = rearrange(act_sequences, 'b l c -> b l 1 c')
 
         prev_feat = rearrange(torch.cat((x, act_sequences), dim=2), 'b l k1 c-> b (l k1) c')
-        # TODO: add position embedding?
         return prev_feat
 
-    def forward_encoder(self, x, mask_ratio=0.75):
+    def forward_encoder(self, x, mask_ratio):
         # embed patches
         x = self.obs_embed(x)
         x = x + self.encoder_pos_embed
         x = self.pos_drop(x)
 
-        # masking: length -> length * mask_ratio
+        # masking
         x, mask, ids_restore = self.random_masking(x, mask_ratio)
 
         # apply encoder blocks
@@ -269,13 +325,14 @@ class MaskWorldModel(nn.Module):
         x = torch.cat([x, mask_tokens], dim=1)
         x = torch.gather(x, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
 
-        # append reward token and env token
+        # append reward token and end token
         reward_tokens = self.reward_token.expand(B, -1, -1)
         end_tokens = self.end_token.expand(B, -1, -1)
         x = torch.cat((x, reward_tokens, end_tokens), dim=1)
 
         # add pos embed
         x = x + self.decoder_pos_embed
+        prev_feat = prev_feat + self.context_pos_embed
 
         # apply decoder blocks
         for blk in self.decoder_blocks:
@@ -287,7 +344,9 @@ class MaskWorldModel(nn.Module):
 
         prev_feat = self.forward_context(prev_obs_tokens, prev_act_tokens)
 
-        curr_feat, mask, ids_restore = self.forward_encoder(curr_obs_tokens, mask_ratio=0.75)
+        t = random.uniform(0, 1)
+        mask_ratio = math.cos(0.5 * math.pi * t)          # sample mask ratio
+        curr_feat, mask, ids_restore = self.forward_encoder(curr_obs_tokens, mask_ratio)
 
         decoder_out = self.forward_decoder(curr_feat, prev_feat, ids_restore)
 
@@ -316,15 +375,139 @@ class MaskWorldModel(nn.Module):
                                                                                            batch['mask_padding'],
                                                                                            obs_mask=outputs.mask)
         # compute loss
+        loss_obs = F.cross_entropy(rearrange(outputs.logits_observations, 'b t o -> (b t) o'), labels_observations)
+        loss_rewards = F.cross_entropy(outputs.logits_rewards, labels_rewards)
+        loss_ends = F.cross_entropy(outputs.logits_ends, labels_ends)
+        return LossWithIntermediateLosses(loss_obs=loss_obs, loss_rewards=loss_rewards, loss_ends=loss_ends)
 
     def compute_labels_world_model(self, obs_tokens, rewards, ends, mask_padding, obs_mask):
-
-        # TODO: add ignore index for mask obs
-
-        assert torch.all(ends.sum(dim=1) <= 1)  # at most 1 done
+        assert torch.all(ends.sum(dim=1) <= 1)   # at most 1 done
         mask_fill = torch.logical_not(mask_padding[:, -1])
         labels_observations = obs_tokens[:, -1].masked_fill(mask_fill.unsqueeze(-1).expand_as(obs_tokens[:, -1]), -100)
+        labels_observations = labels_observations.masked_fill(torch.logical_not(obs_mask), -100)   # compute the loss only on masked patches
         labels_rewards = (rewards[:, -2].sign() + 1).long()
         labels_ends = ends[:, -2]
         return labels_observations.reshape(-1), labels_rewards.reshape(-1), labels_ends.reshape(-1)
+
+    @torch.no_grad()
+    def generate_muse(self, prev_obs_tokens, prev_act_tokens):
+        # See https://github.com/lucidrains/muse-maskgit-pytorch
+        B, context_length, K = prev_obs_tokens.size()
+        obs_tokens = torch.zeros((B, K), dtype=torch.long, device=prev_obs_tokens.device)
+        scores = torch.zeros((B, K), device=prev_obs_tokens.device)  # "ranking scores"
+
+        starting_temperature = 1.0  # TODO: set to ?
+
+        prev_feat = self.forward_context(prev_obs_tokens, prev_act_tokens)
+
+        ##################
+        mask_list = []
+        obs_list = []
+        ##################
+
+        for t, steps_until_x0 in zip(torch.linspace(0, 1, self.num_iter), reversed(range(self.num_iter))):
+
+            x = self.obs_embed(obs_tokens)
+            x = x + self.encoder_pos_embed
+            x = self.pos_drop(x)
+
+            # Step 1 (Mask Schedule): Compute the mask ratio according to the cosine mask scheduling function
+            mask_ratio = math.cos(0.5 * math.pi * t)
+
+            # Step 2 (Mask): Tokens with high "ranking scores" are removed (masked)
+            x, mask, ids_restore = self.scores_masking(x, mask_ratio, scores=scores, is_ranking_scores=True, is_confidence_scores=False)
+            mask_list.append(mask)
+
+            # Step 3 (Predict): Given the unmasked tokens, predict the probability of the remaining masked tokens
+            for blk in self.encoder_blocks:
+                x = blk(x)
+            x = self.encoder_norm(x)
+            decoder_out = self.forward_decoder(x, prev_feat, ids_restore)
+            logits_observations = self.head_observations(decoder_out[:, :-2])
+
+            # Step 4 (Sample): At each masked location, sample a token based on the probability
+            filtered_logits = top_k(logits_observations, thres=0.9)
+            temperature = starting_temperature * (steps_until_x0 / self.num_iter)   # temperature is annealed
+            pred_tokens = gumbel_sample(filtered_logits, temperature=temperature, dim=-1)
+            obs_tokens = torch.where(mask, pred_tokens, obs_tokens)   # (B, K)
+            obs_list.append(obs_tokens)
+            # Use prediction probability as "confidence scores", use 1 - probability as "ranking scores"
+            # Tokens with low "ranking scores" are kept
+            probs_without_temperature = logits_observations.softmax(dim=-1)
+            scores = 1 - probs_without_temperature.gather(dim=2, index=pred_tokens[..., None])
+            scores = rearrange(scores, '... 1 -> ...')
+            scores = scores.masked_fill(~mask, -1e5)    # For the unmasked position, set its ranking score to -1e5
+
+            if steps_until_x0 == 0:
+                logits_rewards = self.head_rewards(decoder_out[:, -2])
+                logits_ends = self.head_ends(decoder_out[:, -1])
+                reward = Categorical(logits=logits_rewards).sample().float().cpu().numpy().reshape(-1) - 1  # (B,)
+                done = Categorical(logits=logits_ends).sample().cpu().numpy().astype(bool).reshape(-1)      # (B,)
+                return obs_tokens, reward, done
+
+            # if steps_until_x0 == 0:
+            #     logits_rewards = self.head_rewards(decoder_out[:, -2])
+            #     logits_ends = self.head_ends(decoder_out[:, -1])
+            #     reward = Categorical(logits=logits_rewards).sample().float().cpu().numpy().reshape(-1) - 1  # (B,)
+            #     done = Categorical(logits=logits_ends).sample().cpu().numpy().astype(bool).reshape(-1)      # (B,)
+            #     return obs_tokens, reward, done, mask_list, obs_list
+
+    @torch.no_grad()
+    def generate_maskgit(self, prev_obs_tokens, prev_act_tokens):
+        # See https://github.com/google-research/maskgit
+        B, context_length, K = prev_obs_tokens.size()
+        obs_tokens = torch.zeros((B, K), dtype=torch.long, device=prev_obs_tokens.device)
+        confidence_scores = torch.zeros((B, K), device=prev_obs_tokens.device)  # "confidence scores"
+
+        choice_temperature = 3.0
+
+        prev_feat = self.forward_context(prev_obs_tokens, prev_act_tokens)
+
+        # start from a blank canvas with all the tokens masked out
+        x = self.obs_embed(obs_tokens)
+        x = x + self.encoder_pos_embed
+        x = self.pos_drop(x)
+        x, mask, ids_restore = self.scores_masking(x, mask_ratio=1.0, scores=confidence_scores, is_ranking_scores=False, is_confidence_scores=True)
+
+        for step in range(self.num_iter):
+            # ------------------------------------------------------------------------------------
+            # Step 1 (Predict): Given the unmasked tokens, predict the probability of the remaining masked tokens
+            for blk in self.encoder_blocks:
+                x = blk(x)
+            x = self.encoder_norm(x)
+            decoder_out = self.forward_decoder(x, prev_feat, ids_restore)
+            logits_observations = self.head_observations(decoder_out[:, :-2])
+            # ------------------------------------------------------------------------------------
+
+            # ------------------------------------------------------------------------------------
+            # Step 2 (Sample): At each masked location, sample a token
+            pred_tokens = Categorical(logits=logits_observations).sample()
+            obs_tokens = torch.where(mask, pred_tokens, obs_tokens)
+            # Use prediction scores plus a noise sampled from a Gumbel distribution multiplied by temperature as "confidence scores"
+            probs = torch.nn.functional.softmax(logits_observations, dim=-1)
+            selected_probs = torch.squeeze(torch.gather(probs, dim=-1, index=pred_tokens[..., None]), -1)
+            selected_probs = torch.where(mask, selected_probs.double(), torch.inf).float()  # The "confidence scores" at the unmasked locations are set to Inf
+            t = 1. * (step + 1) / self.num_iter
+            temperature = choice_temperature * (1 - t)
+            confidence_scores = torch.log(selected_probs) + torch.Tensor(temperature * np.random.gumbel(size=selected_probs.shape)).to(selected_probs.device)
+            # ------------------------------------------------------------------------------------
+
+            # ------------------------------------------------------------------------------------
+            # Step 3 (Mask Schedule): Compute the mask ratio according to the cosine mask scheduling function
+            mask_ratio = math.cos(0.5 * math.pi * t)
+            # ------------------------------------------------------------------------------------
+
+            # ------------------------------------------------------------------------------------
+            # Step 4 (Mask): Tokens with low "confidence scores" are removed (masked)
+            x = self.obs_embed(obs_tokens)
+            x = x + self.encoder_pos_embed
+            x = self.pos_drop(x)
+            x, mask, ids_restore = self.scores_masking(x, mask_ratio, scores=confidence_scores, is_ranking_scores=False, is_confidence_scores=True)
+            # ------------------------------------------------------------------------------------
+
+        logits_rewards = self.head_rewards(decoder_out[:, -2])
+        logits_ends = self.head_ends(decoder_out[:, -1])
+        reward = Categorical(logits=logits_rewards).sample().float().cpu().numpy().reshape(-1) - 1  # (B,)
+        done = Categorical(logits=logits_ends).sample().cpu().numpy().astype(bool).reshape(-1)      # (B,)
+        return obs_tokens, reward, done
 

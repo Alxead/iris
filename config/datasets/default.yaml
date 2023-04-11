@@ -2,6 +2,8 @@ train:
   _target_: dataset.EpisodesDatasetRamMonitoring
   max_ram_usage: 30G
   name: train_dataset
+  balanced_dataset_sampling: False
+  temperature: 20.0
 test:
   _target_: dataset.EpisodesDataset
   max_num_episodes: null
